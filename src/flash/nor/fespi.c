@@ -391,6 +391,9 @@ static int fespi_erase(struct flash_bank *bank, int first, int last)
 		}
 	}
 
+	if (fespi_info->dev->erase_cmd == 0x00)
+		return ERROR_FLASH_OPER_UNSUPPORTED;
+
 	if (fespi_write_reg(bank, FESPI_REG_TXCTRL, FESPI_TXWM(1)) != ERROR_OK)
 		return ERROR_FAIL;
 	retval = fespi_txwm_wait(bank);
@@ -501,6 +504,7 @@ static struct algorithm_steps *as_delete(struct algorithm_steps *as)
 		free(as->steps[step]);
 		as->steps[step] = NULL;
 	}
+	free(as->steps);
 	free(as);
 	return NULL;
 }
@@ -695,17 +699,19 @@ static int steps_execute(struct algorithm_steps *as,
 	init_reg_param(&reg_params[1], "a1", xlen, PARAM_OUT);
 	buf_set_u64(reg_params[0].value, 0, xlen, ctrl_base);
 	buf_set_u64(reg_params[1].value, 0, xlen, data_wa->address);
+
+	int retval = ERROR_OK;
 	while (!as_empty(as)) {
 		keep_alive();
 		uint8_t *data_buf = malloc(data_wa->size);
 		unsigned bytes = as_compile(as, data_buf, data_wa->size);
-		int retval = target_write_buffer(target, data_wa->address, bytes,
+		retval = target_write_buffer(target, data_wa->address, bytes,
 				data_buf);
 		free(data_buf);
 		if (retval != ERROR_OK) {
 			LOG_ERROR("Failed to write data to 0x%" TARGET_PRIxADDR ": %d",
 					data_wa->address, retval);
-			return retval;
+			goto exit;
 		}
 
 		retval = target_run_algorithm(target, 0, NULL, 2, reg_params,
@@ -714,11 +720,14 @@ static int steps_execute(struct algorithm_steps *as,
 		if (retval != ERROR_OK) {
 			LOG_ERROR("Failed to execute algorithm at 0x%" TARGET_PRIxADDR ": %d",
 					algorithm_wa->address, retval);
-			return retval;
+			goto exit;
 		}
 	}
 
-	return ERROR_OK;
+exit:
+	destroy_reg_param(&reg_params[1]);
+	destroy_reg_param(&reg_params[0]);
+	return retval;
 }
 
 static int fespi_write(struct flash_bank *bank, const uint8_t *buffer,
@@ -789,7 +798,9 @@ static int fespi_write(struct flash_bank *bank, const uint8_t *buffer,
 		data_wa_size /= 2;
 	}
 
-	page_size = fespi_info->dev->pagesize;
+	/* If no valid page_size, use reasonable default. */
+	page_size = fespi_info->dev->pagesize ?
+		fespi_info->dev->pagesize : SPIFLASH_DEF_PAGESIZE;
 
 	fespi_txwm_wait(bank);
 
@@ -905,6 +916,7 @@ static int fespi_probe(struct flash_bank *bank)
 	uint32_t id = 0; /* silence uninitialized warning */
 	const struct fespi_target *target_device;
 	int retval;
+	uint32_t sectorsize;
 
 	if (fespi_info->probed)
 		free(bank->sectors);
@@ -923,12 +935,13 @@ static int fespi_probe(struct flash_bank *bank)
 
 		fespi_info->ctrl_base = target_device->ctrl_base;
 
-		LOG_DEBUG("Valid FESPI on device %s at address 0x%" PRIx32,
+		LOG_DEBUG("Valid FESPI on device %s at address 0x%" TARGET_PRIxADDR,
 				target_device->name, bank->base);
 
 	} else {
 	  LOG_DEBUG("Assuming FESPI as specified at address 0x%" TARGET_PRIxADDR
-			  " with ctrl at 0x%x", fespi_info->ctrl_base, bank->base);
+			  " with ctrl at 0x%" TARGET_PRIxADDR, fespi_info->ctrl_base,
+			  bank->base);
 	}
 
 	/* read and decode flash ID; returns in SW mode */
@@ -965,9 +978,17 @@ static int fespi_probe(struct flash_bank *bank)
 	/* Set correct size value */
 	bank->size = fespi_info->dev->size_in_bytes;
 
+	if (bank->size <= (1UL << 16))
+		LOG_WARNING("device needs 2-byte addresses - not implemented");
+	if (bank->size > (1UL << 24))
+		LOG_WARNING("device needs paging or 4-byte addresses - not implemented");
+
+	/* if no sectors, treat whole bank as single sector */
+	sectorsize = fespi_info->dev->sectorsize ?
+		fespi_info->dev->sectorsize : fespi_info->dev->size_in_bytes;
+
 	/* create and fill sectors array */
-	bank->num_sectors =
-		fespi_info->dev->size_in_bytes / fespi_info->dev->sectorsize;
+	bank->num_sectors = fespi_info->dev->size_in_bytes / sectorsize;
 	sectors = malloc(sizeof(struct flash_sector) * bank->num_sectors);
 	if (sectors == NULL) {
 		LOG_ERROR("not enough memory");
@@ -975,8 +996,8 @@ static int fespi_probe(struct flash_bank *bank)
 	}
 
 	for (int sector = 0; sector < bank->num_sectors; sector++) {
-		sectors[sector].offset = sector * fespi_info->dev->sectorsize;
-		sectors[sector].size = fespi_info->dev->sectorsize;
+		sectors[sector].offset = sector * sectorsize;
+		sectors[sector].size = sectorsize;
 		sectors[sector].is_erased = -1;
 		sectors[sector].is_protected = 0;
 	}

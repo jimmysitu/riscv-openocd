@@ -733,17 +733,26 @@ static void gdb_signal_reply(struct target *target, struct connection *connectio
 	if (target->debug_reason == DBG_REASON_EXIT) {
 		sig_reply_len = snprintf(sig_reply, sizeof(sig_reply), "W00");
 	} else {
+		struct target *ct;
+		if (target->rtos != NULL) {
+			target->rtos->current_threadid = target->rtos->current_thread;
+			LOG_DEBUG("current_threadid=%" PRId64, target->rtos->current_threadid);
+			target->rtos->gdb_target_for_threadid(connection, target->rtos->current_threadid, &ct);
+		} else {
+			ct = target;
+		}
+
 		if (gdb_connection->ctrl_c) {
 			signal_var = 0x2;
 		} else
-			signal_var = gdb_last_signal(target);
+			signal_var = gdb_last_signal(ct);
 
 		stop_reason[0] = '\0';
-		if (target->debug_reason == DBG_REASON_WATCHPOINT) {
+		if (ct->debug_reason == DBG_REASON_WATCHPOINT) {
 			enum watchpoint_rw hit_wp_type;
 			target_addr_t hit_wp_address;
 
-			if (watchpoint_hit(target, &hit_wp_type, &hit_wp_address) == ERROR_OK) {
+			if (watchpoint_hit(ct, &hit_wp_type, &hit_wp_address) == ERROR_OK) {
 
 				switch (hit_wp_type) {
 					case WPT_WRITE:
@@ -765,15 +774,9 @@ static void gdb_signal_reply(struct target *target, struct connection *connectio
 		}
 
 		current_thread[0] = '\0';
-		if (target->rtos != NULL) {
-			struct target *ct;
+		if (target->rtos != NULL)
 			snprintf(current_thread, sizeof(current_thread), "thread:%" PRIx64 ";",
 					target->rtos->current_thread);
-			target->rtos->current_threadid = target->rtos->current_thread;
-			target->rtos->gdb_target_for_threadid(connection, target->rtos->current_threadid, &ct);
-			if (!gdb_connection->ctrl_c)
-				signal_var = gdb_last_signal(ct);
-		}
 
 		sig_reply_len = snprintf(sig_reply, sizeof(sig_reply), "T%2.2x%s%s",
 				signal_var, stop_reason, current_thread);
@@ -1179,8 +1182,11 @@ static int gdb_get_registers_packet(struct connection *connection,
 	if (retval != ERROR_OK)
 		return gdb_error(connection, retval);
 
-	for (i = 0; i < reg_list_size; i++)
+	for (i = 0; i < reg_list_size; i++) {
+		if (reg_list[i] == NULL || reg_list[i]->exist == false)
+			continue;
 		reg_packet_size += DIV_ROUND_UP(reg_list[i]->size, 8) * 2;
+	}
 
 	assert(reg_packet_size > 0);
 
@@ -1191,6 +1197,8 @@ static int gdb_get_registers_packet(struct connection *connection,
 	reg_packet_p = reg_packet;
 
 	for (i = 0; i < reg_list_size; i++) {
+		if (reg_list[i] == NULL || reg_list[i]->exist == false)
+			continue;
 		if (!reg_list[i]->valid) {
 			retval = reg_list[i]->type->get(reg_list[i]);
 			if (retval != ERROR_OK && gdb_report_register_access_error) {
@@ -1296,7 +1304,10 @@ static int gdb_get_register_packet(struct connection *connection,
 	LOG_DEBUG("-");
 #endif
 
-	retval = target_get_gdb_reg_list(target, &reg_list, &reg_list_size,
+	if ((target->rtos != NULL) && (ERROR_OK == rtos_get_gdb_reg(connection, reg_num)))
+		return ERROR_OK;
+
+	retval = target_get_gdb_reg_list_noread(target, &reg_list, &reg_list_size,
 			REG_CLASS_ALL);
 	if (retval != ERROR_OK)
 		return gdb_error(connection, retval);
@@ -1332,37 +1343,49 @@ static int gdb_set_register_packet(struct connection *connection,
 {
 	struct target *target = get_target_from_connection(connection);
 	char *separator;
-	uint8_t *bin_buf;
 	int reg_num = strtoul(packet + 1, &separator, 16);
 	struct reg **reg_list;
 	int reg_list_size;
 	int retval;
 
+#ifdef _DEBUG_GDB_IO_
 	LOG_DEBUG("-");
-
-	retval = target_get_gdb_reg_list(target, &reg_list, &reg_list_size,
-			REG_CLASS_ALL);
-	if (retval != ERROR_OK)
-		return gdb_error(connection, retval);
-
-	if (reg_list_size <= reg_num) {
-		LOG_ERROR("gdb requested a non-existing register");
-		return ERROR_SERVER_REMOTE_CLOSED;
-	}
+#endif
 
 	if (*separator != '=') {
 		LOG_ERROR("GDB 'set register packet', but no '=' following the register number");
 		return ERROR_SERVER_REMOTE_CLOSED;
 	}
+	size_t chars = strlen(separator + 1);
+	uint8_t *bin_buf = malloc(chars / 2);
+	gdb_target_to_reg(target, separator + 1, chars, bin_buf);
 
-	/* convert from GDB-string (target-endian) to hex-string (big-endian) */
-	bin_buf = malloc(DIV_ROUND_UP(reg_list[reg_num]->size, 8));
-	int chars = (DIV_ROUND_UP(reg_list[reg_num]->size, 8) * 2);
-
-	if ((unsigned int)chars != strlen(separator + 1)) {
-		LOG_ERROR("gdb sent %zu bits for a %d-bit register (%s)",
-				strlen(separator + 1) * 4, chars * 4, reg_list[reg_num]->name);
+	if ((target->rtos != NULL) &&
+			(ERROR_OK == rtos_set_reg(connection, reg_num, bin_buf))) {
 		free(bin_buf);
+		gdb_put_packet(connection, "OK", 2);
+		return ERROR_OK;
+	}
+
+	retval = target_get_gdb_reg_list_noread(target, &reg_list, &reg_list_size,
+			REG_CLASS_ALL);
+	if (retval != ERROR_OK) {
+		free(bin_buf);
+		return gdb_error(connection, retval);
+	}
+
+	if (reg_list_size <= reg_num) {
+		LOG_ERROR("gdb requested a non-existing register");
+		free(bin_buf);
+		free(reg_list);
+		return ERROR_SERVER_REMOTE_CLOSED;
+	}
+
+	if (chars != (DIV_ROUND_UP(reg_list[reg_num]->size, 8) * 2)) {
+		LOG_ERROR("gdb sent %d bits for a %d-bit register (%s)",
+				(int) chars * 4, reg_list[reg_num]->size, reg_list[reg_num]->name);
+		free(bin_buf);
+		free(reg_list);
 		return ERROR_SERVER_REMOTE_CLOSED;
 	}
 
@@ -1632,7 +1655,7 @@ static int gdb_breakpoint_watchpoint_packet(struct connection *connection,
 	char *separator;
 	int retval;
 
-	LOG_DEBUG("-");
+	LOG_DEBUG("[%d]", target->coreid);
 
 	type = strtoul(packet + 1, &separator, 16);
 
@@ -1911,11 +1934,10 @@ static int gdb_memory_map(struct connection *connection,
 	if (ram_start != 0)
 		xml_printf(&retval, &xml, &pos, &size,
 			"<memory type=\"ram\" start=\"" TARGET_ADDR_FMT "\" "
-			"length=\"0x%x\"/>\n",
-			ram_start, 0-ram_start);
-	/* ELSE a flash chip could be at the very end of the 32 bit address
-	 * space, in which case ram_start will be precisely 0
-	 */
+			"length=\"" TARGET_ADDR_FMT "\"/>\n",
+			ram_start, TARGET_ADDR_MAX - ram_start + 1);
+	/* ELSE a flash chip could be at the very end of the address space, in
+	 * which case ram_start will be precisely 0 */
 
 	free(banks);
 
@@ -2188,6 +2210,7 @@ static int gdb_generate_target_description(struct target *target, char **tdesc_o
 	int retval = ERROR_OK;
 	struct reg **reg_list = NULL;
 	int reg_list_size;
+	char const *architecture;
 	char const **features = NULL;
 	char const **arch_defined_types = NULL;
 	int feature_list_size = 0;
@@ -2198,7 +2221,7 @@ static int gdb_generate_target_description(struct target *target, char **tdesc_o
 
 	arch_defined_types = calloc(1, sizeof(char *));
 
-	retval = target_get_gdb_reg_list(target, &reg_list,
+	retval = target_get_gdb_reg_list_noread(target, &reg_list,
 			&reg_list_size, REG_CLASS_ALL);
 
 	if (retval != ERROR_OK) {
@@ -2228,6 +2251,12 @@ static int gdb_generate_target_description(struct target *target, char **tdesc_o
 			"<?xml version=\"1.0\"?>\n"
 			"<!DOCTYPE target SYSTEM \"gdb-target.dtd\">\n"
 			"<target version=\"1.0\">\n");
+
+	/* generate architecture element if supported by target */
+	architecture = target_get_gdb_arch(target);
+	if (architecture != NULL)
+		xml_printf(&retval, &tdesc, &pos, &size,
+				"<architecture>%s</architecture>\n", architecture);
 
 	/* generate target description according to register list */
 	if (features != NULL) {
@@ -2378,10 +2407,13 @@ static int gdb_target_description_supported(struct target *target, int *supporte
 	char const **features = NULL;
 	int feature_list_size = 0;
 
-	retval = target_get_gdb_reg_list(target, &reg_list,
+	char const *architecture = target_get_gdb_arch(target);
+
+	retval = target_get_gdb_reg_list_noread(target, &reg_list,
 			&reg_list_size, REG_CLASS_ALL);
 	if (retval != ERROR_OK) {
 		LOG_ERROR("get register list failed");
+		reg_list = NULL;
 		goto error;
 	}
 
@@ -2399,7 +2431,7 @@ static int gdb_target_description_supported(struct target *target, int *supporte
 	}
 
 	if (supported) {
-		if (feature_list_size)
+		if (architecture || feature_list_size)
 			*supported = 1;
 		else
 			*supported = 0;
@@ -3377,6 +3409,8 @@ static int gdb_target_start(struct target *target, const char *port)
 	if (NULL == gdb_service)
 		return -ENOMEM;
 
+	LOG_DEBUG("starting gdb server for %s on %s", target_name(target), port);
+
 	gdb_service->target = target;
 	gdb_service->core[0] = -1;
 	gdb_service->core[1] = -1;
@@ -3402,16 +3436,36 @@ static int gdb_target_start(struct target *target, const char *port)
 
 static int gdb_target_add_one(struct target *target)
 {
+	/*  one gdb instance per smp list */
+	if ((target->smp) && (target->gdb_service))
+		return ERROR_OK;
+
+	/* skip targets that cannot handle a gdb connections (e.g. mem_ap) */
+	if (!target_supports_gdb_connection(target)) {
+		LOG_DEBUG("skip gdb server for target %s", target_name(target));
+		return ERROR_OK;
+	}
+
+	if (target->gdb_port_override) {
+		if (strcmp(target->gdb_port_override, "disabled") == 0) {
+			LOG_INFO("gdb port disabled");
+			return ERROR_OK;
+		}
+		return gdb_target_start(target, target->gdb_port_override);
+	}
+
 	if (strcmp(gdb_port, "disabled") == 0) {
 		LOG_INFO("gdb port disabled");
 		return ERROR_OK;
 	}
 
-	/*  one gdb instance per smp list */
-	if ((target->smp) && (target->gdb_service))
-		return ERROR_OK;
 	int retval = gdb_target_start(target, gdb_port_next);
 	if (retval == ERROR_OK) {
+		/* save the port number so can be queried with
+		 * $target_name cget -gdb-port
+		 */
+		target->gdb_port_override = strdup(gdb_port_next);
+
 		long portnumber;
 		/* If we can parse the port number
 		 * then we increment the port number for the next target.
@@ -3436,11 +3490,6 @@ static int gdb_target_add_one(struct target *target)
 
 int gdb_target_add_all(struct target *target)
 {
-	if (strcmp(gdb_port, "disabled") == 0) {
-		LOG_INFO("gdb server disabled");
-		return ERROR_OK;
-	}
-
 	if (NULL == target) {
 		LOG_WARNING("gdb services need one or more targets defined");
 		return ERROR_OK;
